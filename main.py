@@ -434,7 +434,7 @@ def fastapi_app():
 # --- Scheduled Cleanup Function ---
 
 @app.function(
-    schedule=modal.Cron("*/10 * * * *"), # Runs every 10 minutes
+    schedule=modal.Cron("0 2 * * *"), # Runs once daily at 2 AM UTC
     image=image,
     volumes={"/data": volume},
 )
