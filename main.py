@@ -148,7 +148,7 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             model = request.get("model")
             timeout_s = request.get("timeout_s", DEFAULT_JOB_TIMEOUT_S)
 
-            cmd = ["claude", "-p", prompt, "--output-format", "json"]
+            cmd = ["claude", "-p", prompt, "--output-format", "json", "--debug"]
             if model:
                 cmd.extend(["-m", model])
 
