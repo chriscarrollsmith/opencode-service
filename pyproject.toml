@@ -1,0 +1,17 @@
+[project]
+name = "claude-code-service"
+version = "0.1.0"
+description = "A Modal-based cloud runner for @anthropic-ai/claude-code"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "modal>=1.1.1",
+    "pydantic>=2.7.0", # For file streaming endpoint
+    "fastapi",
+    "requests>=2.32.4",
+    "python-dotenv>=1.1.1",
+]
+
+[tool.modal]
+# This section can be used to set default deployment names, etc.
+# For now, we'll keep it simple.
