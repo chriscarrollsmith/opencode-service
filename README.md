@@ -11,37 +11,36 @@ Secure, key-protected FastAPI service on Modal that runs `@anthropic-ai/claude-c
 
 ### Prerequisites
 
-- Modal CLI installed and authenticated (`modal token set ...`).
-- Create an API key and store it as a Modal secret.
+- [`uv`](https://docs.astral.sh/uv/getting-started/installation/) installed
+- Project dependencies installed: `uv sync`
+- Modal CLI authenticated (`uv run modal setup`).
+- Generated API key and Anthropic API key stored as a Modal secret:
+  ```bash
+  export API_KEY=$(openssl rand -hex 32)
+  export ANTHROPIC_API_KEY='your-anthropic-api-key'
+  uv run modal secret create claude-code-secret API_KEY=$API_KEY ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+  echo "API_KEY=$API_KEY" >> .env
+  echo "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY" >> .env
+  ```
 
 ### Setup and deployment
 
-1) Generate an API key and store it as a Modal secret along with your Anthropic API key (keep the key safe):
+1) Deploy the service:
 
 ```bash
-export API_KEY=$(openssl rand -hex 32)
-export ANTHROPIC_API_KEY='your-anthropic-api-key'
-modal secret create claude-code-secret API_KEY=$API_KEY ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
+uv run modal deploy main.py
 ```
 
-2) Deploy the service:
+2) (Optional) Run the built-in smoke test. It will use the deployed URL and your `API_KEY`:
 
 ```bash
-modal deploy main.py
+uv run modal run main.py::main  # `uv` loads the .env file
 ```
-
-3) (Optional) Run the built-in smoke test. It will use the deployed URL and your `API_KEY`:
-
-```bash
-API_KEY=$API_KEY modal run main.py::main
-```
-
-The deployment exposes a single ASGI app. In code, its URL is available as `fastapi_app.web_url`.
 
 ### Authentication
 
 - Send `X-API-Key: $API_KEY` with every request (except `GET /health`).
-- The expected key is read from the Modal secret `claude-code-auth-secret` (env var `API_KEY`).
+- The expected key is read from the Modal secret `claude-code-secret` (env var `API_KEY`).
 
 ### Endpoints
 
