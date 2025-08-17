@@ -9,7 +9,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 import modal
 from fastapi import FastAPI, HTTPException, Response, Request
@@ -20,11 +20,11 @@ from pydantic import BaseModel, Field
 # --- Constants and Configuration ---
 
 # Service-level configuration
-APP_NAME = "claude-code-service"
-VOLUME_NAME = "claude-code-data"
-SESSIONS_DICT_NAME = "claude-code-sessions"
-JOBS_DICT_NAME = "claude-code-jobs"
-SECRET_NAME = "claude-code-secret"
+APP_NAME = "opencode-service"
+VOLUME_NAME = "opencode-data"
+SESSIONS_DICT_NAME = "opencode-sessions"
+JOBS_DICT_NAME = "opencode-jobs"
+SECRET_NAME = "opencode-secret"
 
 # Operational limits and defaults
 MAX_SESSION_SIZE_MB = 25
@@ -50,12 +50,9 @@ jobs_dict = modal.Dict.from_name(JOBS_DICT_NAME, create_if_missing=True)
 # Image definition
 image = (
     modal.Image.debian_slim(python_version="3.13")
+    .apt_install("curl", "git", "unzip")
     .run_commands(
-        "apt-get update",
-        "apt-get install -y curl git",
-        "curl -fsSL https://deb.nodesource.com/setup_20.x | bash -",
-        "apt-get install -y nodejs",
-        "npm install -g @anthropic-ai/claude-code",
+        "curl -fsSL https://opencode.ai/install | bash"
     )
     .pip_install("fastapi", "pydantic") # fastapi for web_asgi
 )
@@ -82,7 +79,7 @@ class SessionCreateResponse(BaseModel):
 
 class JobRunRequest(BaseModel):
     prompt: str
-    model: Optional[str] = Field(None, description="Claude model to use (e.g., 'claude-4-sonnet')")
+    model: Optional[str] = Field("openai/gpt-5", description="Provider-prefixed AI model to use (e.g., 'openai/gpt-5')")
     timeout_s: int = Field(DEFAULT_JOB_TIMEOUT_S, gt=0, le=MAX_JOB_TIMEOUT_S)
 
 class JobRunResponse(BaseModel):
@@ -100,7 +97,7 @@ class OutputFileResult(BaseModel):
 class JobStatusResponse(BaseModel):
     job_id: str
     session_id: str
-    status: str # "queued", "running", "succeeded", "failed", "timed_out"
+    status: Literal["queued", "running", "succeeded", "failed", "timed_out"]
     error: Optional[str] = None
     prompt: str
     created_at: datetime
@@ -118,12 +115,12 @@ class SessionResultsResponse(BaseModel):
 @app.function(
     image=image,
     volumes={"/data": volume},
-    secrets=[modal.Secret.from_name(SECRET_NAME)],
+    secrets=[modal.Secret.from_name(SECRET_NAME)],  # Allow any provider keys
     timeout=MAX_JOB_TIMEOUT_S + 60,  # Allow buffer over job timeout
     max_containers=10, # Adjust as needed
 )
 def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
-    """The background worker that executes a claude-code run."""
+    """The background worker that executes an opencode run."""
     session_input_dir = SESSIONS_ROOT / session_id / "input"
     session_output_dir = SESSIONS_ROOT / session_id / "output"
     now = datetime.now(timezone.utc)
@@ -143,16 +140,33 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             # 2. Materialize workspace by copying from Volume
             shutil.copytree(session_input_dir, workspace, dirs_exist_ok=True)
 
-            # 3. Execute Claude Code (with simple retry for transient failures)
+            # 3. Execute OpenCode (with simple retry for transient failures)
             prompt = request["prompt"]
-            model = request.get("model")
+            model = request.get("model", "openai/gpt-5")
             timeout_s = request.get("timeout_s", DEFAULT_JOB_TIMEOUT_S)
 
-            cmd = ["claude", "-p", prompt, "--output-format", "json", "--debug"]
+            cmd = ["opencode", "run", prompt]
             if model:
                 cmd.extend(["-m", model])
 
+            # OpenCode will use provider API keys from environment
             env = os.environ.copy()
+            # Add opencode installation directory to PATH
+            env["PATH"] = f"/root/.opencode/bin:{env.get('PATH', '')}"
+            
+            # Check for required API key based on model provider
+            if model and model.startswith("anthropic/"):
+                if "ANTHROPIC_API_KEY" not in env:
+                    raise RuntimeError("ANTHROPIC_API_KEY not found in environment for Anthropic model")
+            elif model and model.startswith("openai/"):
+                if "OPENAI_API_KEY" not in env:
+                    raise RuntimeError("OPENAI_API_KEY not found in environment for OpenAI model")
+            elif model and model.startswith("google/"):
+                if "GEMINI_API_KEY" not in env:
+                    raise RuntimeError("GEMINI_API_KEY not found in environment for Google model")
+            elif model and model.startswith("openrouter/"):
+                if "OPENROUTER_API_KEY" not in env:
+                    raise RuntimeError("OPENROUTER_API_KEY not found in environment for OpenRouter model")
 
             last_err: Optional[str] = None
             max_attempts = 2
@@ -171,11 +185,11 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
                 if attempt < max_attempts:
                     time.sleep(1.0)
             if result.returncode != 0:
-                raise RuntimeError(f"Claude Code failed after {max_attempts} attempts:\n{last_err}")
+                raise RuntimeError(f"OpenCode failed after {max_attempts} attempts:\n{last_err}")
 
             # 4. Process results
             if result.returncode != 0:
-                raise RuntimeError(f"Claude Code failed:\n{result.stderr}")
+                raise RuntimeError(f"OpenCode failed:\n{result.stderr}")
 
             # 5. Clear previous output and copy new files to Volume
             if os.path.exists(session_output_dir):
@@ -234,15 +248,15 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
     image=image,
     volumes={"/data": volume},
     timeout=MAX_JOB_TIMEOUT_S + 60,
-    secrets=[modal.Secret.from_name(SECRET_NAME, required_keys=["API_KEY"])],
+    secrets=[modal.Secret.from_name(SECRET_NAME, required_keys=["API_KEY"])],  # API_KEY is required, provider keys are optional
 )
 @modal.asgi_app()
 def fastapi_app():
     """Serve the service as a secured FastAPI app with API key authentication."""
 
     secure_app = FastAPI(
-        title="Claude Code Service (Secured)",
-        description="Secure API for Claude Code service endpoints",
+        title="OpenCode Service (Secured)",
+        description="Secure API for OpenCode service endpoints",
         version="1.0.0",
     )
 
@@ -477,8 +491,8 @@ def main():
     
     load_dotenv()
     
-    """A local test client for the Claude Code service."""
-    print("🚀 Testing Claude Code Service...")
+    """A local test client for the OpenCode service."""
+    print("🚀 Testing OpenCode Service...")
 
     # 1. Create a session
     print("\n[1] Creating session...")
@@ -507,7 +521,10 @@ def main():
 
     # 2. Run a job
     print("\n[2] Running job...")
-    run_req = JobRunRequest(prompt="Add a function to subtract two numbers in math_utils.py")
+    run_req = JobRunRequest(
+        prompt="Add a function to subtract two numbers in math_utils.py",
+        model="openai/gpt-5"  # Explicitly specify model for testing
+    )
     run_response = requests.post(f"{base}/job", params={"session_id": session_id}, json=run_req.model_dump(), headers=headers)
     if run_response.status_code != 200:
         print(f"❌ Error running job: {run_response.status_code} {run_response.text}")

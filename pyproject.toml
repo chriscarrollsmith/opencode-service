@@ -1,7 +1,7 @@
 [project]
-name = "claude-code-service"
+name = "opencode-service"
 version = "0.1.0"
-description = "A Modal-based cloud runner for @anthropic-ai/claude-code"
+description = "A Modal-based cloud runner for opencode-ai"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
