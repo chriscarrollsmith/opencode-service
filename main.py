@@ -54,7 +54,7 @@ image = (
     .run_commands(
         "curl -fsSL https://opencode.ai/install | bash"
     )
-    .pip_install("fastapi", "pydantic") # fastapi for web_asgi
+    .uv_pip_install("fastapi", "pydantic") # fastapi for web_asgi
 )
 
 # --- Pydantic Models for API ---
@@ -104,11 +104,13 @@ class JobStatusResponse(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     output_files: Optional[List[OutputFileResult]] = None
+    stdout: Optional[str] = None
 
 class SessionResultsResponse(BaseModel):
     session_id: str
     latest_job_id: Optional[str] = None
     output_files: List[OutputFileResult]
+    result: Optional[str] = None
 
 # --- Core Worker Function ---
 
@@ -145,7 +147,7 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             model = request.get("model", "openai/gpt-5")
             timeout_s = request.get("timeout_s", DEFAULT_JOB_TIMEOUT_S)
 
-            cmd = ["opencode", "run", prompt]
+            cmd = ["opencode", "run", prompt, "--print-logs"]
             if model:
                 cmd.extend(["-m", model])
 
@@ -214,7 +216,8 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             job_data.update({
                 "status": "succeeded",
                 "finished_at": finished_at.isoformat(),
-                "output_files": output_files_manifest
+                "output_files": output_files_manifest,
+                "stdout": result.stdout,
             })
             jobs_dict[job_id] = job_data
             
@@ -403,6 +406,7 @@ def fastapi_app():
             session_id=session_id,
             latest_job_id=latest_job_id,
             output_files=files,
+            result=job_data.get("stdout"),
         )
 
     @secure_app.get("/download")
@@ -523,7 +527,7 @@ def main():
     print("\n[2] Running job...")
     run_req = JobRunRequest(
         prompt="Add a function to subtract two numbers in math_utils.py",
-        model="openai/gpt-5"  # Explicitly specify model for testing
+        model="openrouter/moonshotai/kimi-k2"  # Explicitly specify model for testing
     )
     run_response = requests.post(f"{base}/job", params={"session_id": session_id}, json=run_req.model_dump(), headers=headers)
     if run_response.status_code != 200:
@@ -561,6 +565,10 @@ def main():
         print("   Output files:")
         for f in results_parsed.output_files:
             print(f"   - {f.path} ({f.size_bytes} bytes)")
+        if results_parsed.result:
+            print("\n   Stdout (truncated to 2k chars):")
+            to_print = results_parsed.result[:2000]
+            print(to_print)
 
 
     # 5. Download a file
