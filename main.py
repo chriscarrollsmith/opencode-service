@@ -171,34 +171,58 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
                     raise RuntimeError("OPENROUTER_API_KEY not found in environment for OpenRouter model")
 
             last_err: Optional[str] = None
+            combined_output: Optional[str] = None
+            returncode: Optional[int] = None
             max_attempts = 2
+            # Encourage unbuffered output from Python-based CLIs
+            env["PYTHONUNBUFFERED"] = "1"
             for attempt in range(1, max_attempts + 1):
-                result = subprocess.run(
+                stdout_lines: List[str] = []
+                proc = subprocess.Popen(
                     cmd,
-                    capture_output=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
                     text=True,
                     cwd=str(workspace),
                     env=env,
-                    timeout=timeout_s
+                    bufsize=1,
                 )
-                if result.returncode == 0:
+                try:
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        print(line.rstrip(), flush=True)
+                        stdout_lines.append(line)
+                    proc.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    try:
+                        proc.communicate(timeout=2)
+                    except Exception:
+                        pass
+                    raise
+                finally:
+                    try:
+                        if proc.stdout is not None:
+                            proc.stdout.close()
+                    except Exception:
+                        pass
+
+                returncode = proc.returncode
+                combined_output = "".join(stdout_lines)
+                if returncode == 0:
                     break
-                last_err = result.stderr
+                last_err = combined_output
                 if attempt < max_attempts:
                     time.sleep(1.0)
-            if result.returncode != 0:
+            if returncode != 0:
                 raise RuntimeError(f"OpenCode failed after {max_attempts} attempts:\n{last_err}")
 
-            # 4. Process results
-            if result.returncode != 0:
-                raise RuntimeError(f"OpenCode failed:\n{result.stderr}")
-
-            # 5. Clear previous output and copy new files to Volume
+            # 4. Clear previous output and copy new files to Volume
             if os.path.exists(session_output_dir):
                 shutil.rmtree(session_output_dir)
             shutil.copytree(workspace, session_output_dir, dirs_exist_ok=True)
             
-            # 6. Generate manifest of output files
+            # 5. Generate manifest of output files
             output_files_manifest = []
             for f_path in Path(session_output_dir).glob("**/*"):
                 if f_path.is_file():
@@ -211,13 +235,13 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
                         }
                     )
 
-            # 7. Update job status to "succeeded"
+            # 6. Update job status to "succeeded"
             finished_at = datetime.now(timezone.utc)
             job_data.update({
                 "status": "succeeded",
                 "finished_at": finished_at.isoformat(),
                 "output_files": output_files_manifest,
-                "stdout": result.stdout,
+                "stdout": combined_output or "",
             })
             jobs_dict[job_id] = job_data
             
@@ -231,17 +255,21 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             volume.commit()
 
     except subprocess.TimeoutExpired:
+        # Include any logs captured up to the timeout
         job_data.update({
             "status": "timed_out",
             "error": f"Job exceeded the timeout of {request.get('timeout_s', DEFAULT_JOB_TIMEOUT_S)} seconds.",
             "finished_at": datetime.now(timezone.utc).isoformat(),
+            "stdout": locals().get("combined_output", "") or locals().get("last_err", ""),
         })
         jobs_dict[job_id] = job_data
     except Exception as e:
+        # Include any logs captured when the process failed
         job_data.update({
             "status": "failed",
             "error": str(e),
             "finished_at": datetime.now(timezone.utc).isoformat(),
+            "stdout": locals().get("combined_output", "") or locals().get("last_err", ""),
         })
         jobs_dict[job_id] = job_data
 
