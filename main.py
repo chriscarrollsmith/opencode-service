@@ -1,6 +1,7 @@
 # main.py
 
 import hashlib
+import asyncio
 import os
 import shutil
 import subprocess
@@ -9,13 +10,13 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, ClassVar, Set
 
 import modal
 from fastapi import FastAPI, HTTPException, Response, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- Constants and Configuration ---
 
@@ -66,6 +67,34 @@ class FileInput(BaseModel):
 class SessionCreateRequest(BaseModel):
     files: List[FileInput]
     ttl_seconds: int = Field(DEFAULT_SESSION_TTL_S, gt=0)
+    env: Optional[Dict[str, str]] = Field(default=None, description="Environment variables to apply for this session")
+
+    # Reserved variables that users cannot override
+    RESERVED_ENV_VARS: ClassVar[Set[str]] = {
+        "API_KEY",  # service auth between client and API
+        # Modal / internal env protection
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+    }
+
+    @field_validator("env")
+    @classmethod
+    def validate_env(cls, v: Optional[Dict[str, str]]):
+        if v is None:
+            return None
+        validated: Dict[str, str] = {}
+        for k, val in v.items():
+            if not isinstance(k, str):
+                raise ValueError("All environment variable names must be strings")
+            key = k.strip()
+            if not key:
+                raise ValueError("Environment variable names cannot be empty")
+            if key in cls.RESERVED_ENV_VARS:
+                raise ValueError(f"Environment variable '{key}' is reserved and cannot be overridden")
+            if not isinstance(val, str):
+                raise ValueError(f"Environment variable '{key}' value must be a string")
+            validated[key] = val
+        return validated
 
 class FileInfo(BaseModel):
     path: str
@@ -105,12 +134,14 @@ class JobStatusResponse(BaseModel):
     finished_at: Optional[datetime] = None
     output_files: Optional[List[OutputFileResult]] = None
     stdout: Optional[str] = None
+    result_json: Optional[Dict[str, Any]] = None
 
 class SessionResultsResponse(BaseModel):
     session_id: str
     latest_job_id: Optional[str] = None
     output_files: List[OutputFileResult]
     result: Optional[str] = None
+    result_json: Optional[Dict[str, Any]] = None
 
 # --- Core Worker Function ---
 
@@ -140,6 +171,16 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             workspace = Path(tmpdir)
 
             # 2. Materialize workspace by copying from Volume
+            # Ensure latest visibility of files across containers
+            try:
+                volume.reload()
+            except Exception:
+                pass
+            wait_deadline = time.time() + 10.0
+            while not session_input_dir.exists() and time.time() < wait_deadline:
+                time.sleep(0.2)
+            if not session_input_dir.exists():
+                raise FileNotFoundError(f"Session input directory missing: {session_input_dir}")
             shutil.copytree(session_input_dir, workspace, dirs_exist_ok=True)
 
             # 3. Execute OpenCode (with simple retry for transient failures)
@@ -155,6 +196,13 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
             env = os.environ.copy()
             # Add opencode installation directory to PATH
             env["PATH"] = f"/root/.opencode/bin:{env.get('PATH', '')}"
+            # Merge per-session environment variables (if any)
+            try:
+                session_data_env = sessions_dict.get(session_id, {}).get("env")
+            except Exception:
+                session_data_env = None
+            if isinstance(session_data_env, dict):
+                env.update({str(k): str(v) for k, v in session_data_env.items()})
             
             # Check for required API key based on model provider
             if model and model.startswith("anthropic/"):
@@ -199,7 +247,32 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
                         proc.communicate(timeout=2)
                     except Exception:
                         pass
-                    raise
+                    # Preserve partial outputs on timeout
+                    if os.path.exists(session_output_dir):
+                        shutil.rmtree(session_output_dir)
+                    shutil.copytree(workspace, session_output_dir, dirs_exist_ok=True)
+                    # Build manifest for any files created before timeout
+                    output_files_manifest = []
+                    for f_path in Path(session_output_dir).glob("**/*"):
+                        if f_path.is_file():
+                            content = f_path.read_bytes()
+                            output_files_manifest.append(
+                                {
+                                    "path": str(f_path.relative_to(session_output_dir)),
+                                    "size_bytes": len(content),
+                                    "sha256": hashlib.sha256(content).hexdigest(),
+                                }
+                            )
+                    job_data.update({
+                        "status": "timed_out",
+                        "error": f"Job exceeded the timeout of {request.get('timeout_s', DEFAULT_JOB_TIMEOUT_S)} seconds.",
+                        "finished_at": datetime.now(timezone.utc).isoformat(),
+                        "output_files": output_files_manifest,
+                        "stdout": "".join(stdout_lines),
+                    })
+                    jobs_dict[job_id] = job_data
+                    volume.commit()
+                    return
                 finally:
                     try:
                         if proc.stdout is not None:
@@ -235,6 +308,33 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
                         }
                     )
 
+            # Try to parse structured JSON or JSONL from stdout
+            parsed_result: Optional[Dict[str, Any]] = None
+            if combined_output:
+                text = combined_output.strip()
+                if text:
+                    try:
+                        import json as _json
+                        parsed_result = _json.loads(text)
+                    except Exception:
+                        try:
+                            import json as _json
+                            items = []
+                            for line in text.splitlines():
+                                s = line.strip()
+                                if not s:
+                                    continue
+                                try:
+                                    obj = _json.loads(s)
+                                    if isinstance(obj, dict):
+                                        items.append(obj)
+                                except Exception:
+                                    continue
+                            if items:
+                                parsed_result = {"stream": items, "final": items[-1]}
+                        except Exception:
+                            parsed_result = None
+
             # 6. Update job status to "succeeded"
             finished_at = datetime.now(timezone.utc)
             job_data.update({
@@ -242,6 +342,7 @@ def execute_job(session_id: str, job_id: str, request: Dict[str, Any]):
                 "finished_at": finished_at.isoformat(),
                 "output_files": output_files_manifest,
                 "stdout": combined_output or "",
+                "result_json": parsed_result,
             })
             jobs_dict[job_id] = job_data
             
@@ -349,6 +450,7 @@ def fastapi_app():
             "created_at": now.isoformat(),
             "expires_at": expires_at.isoformat(),
             "size_bytes": total_size,
+            "env": (req.env or {}),
         }
 
         return SessionCreateResponse(
@@ -435,6 +537,7 @@ def fastapi_app():
             latest_job_id=latest_job_id,
             output_files=files,
             result=job_data.get("stdout"),
+            result_json=job_data.get("result_json"),
         )
 
     @secure_app.get("/download")
@@ -462,7 +565,18 @@ def fastapi_app():
             raise HTTPException(status_code=400, detail="Invalid file path")
 
         if not full_path_resolved.exists() or not full_path_resolved.is_file():
-            raise HTTPException(status_code=404, detail="File not found in session output")
+            # Allow brief propagation lag between containers before returning 404
+            wait_deadline = time.time() + 5.0
+            while True:
+                if full_path_resolved.exists() and full_path_resolved.is_file():
+                    break
+                if time.time() >= wait_deadline:
+                    raise HTTPException(status_code=404, detail="File not found in session output")
+                try:
+                    volume.reload()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.2)
 
         def file_iterator(chunk_size: int = 1024 * 64):
             with open(full_path_resolved, "rb") as f:
@@ -555,7 +669,7 @@ def main():
     print("\n[2] Running job...")
     run_req = JobRunRequest(
         prompt="Add a function to subtract two numbers in math_utils.py",
-        model="openrouter/moonshotai/kimi-k2"  # Explicitly specify model for testing
+        model="openrouter/z-ai/glm-4.6"  # Explicitly specify model for testing
     )
     run_response = requests.post(f"{base}/job", params={"session_id": session_id}, json=run_req.model_dump(), headers=headers)
     if run_response.status_code != 200:
